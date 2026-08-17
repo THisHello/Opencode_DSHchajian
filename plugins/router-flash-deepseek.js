@@ -1,6 +1,7 @@
 /**
- * router-flash-deepseek.js — opencode port of dsh-router-standard (v0.2.0),
- * scoped to DeepSeek V4 Flash only.
+ * router-flash-deepseek.js — opencode port of dsh-router-standard (v0.2.0,
+ * synced to upstream main f9667f7; only docs changed after eff787e), scoped
+ * to DeepSeek V4 Flash only.
  *
  * Reads the session's first top-level user message, classifies the task into
  * one of the measured behavior bands (spec / mixed / react) or weak (the

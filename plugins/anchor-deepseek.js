@@ -1,7 +1,8 @@
 /**
  * anchor-deepseek.js — local opencode port of the DSH anchored presets,
- * synced to upstream main (ffb845c, incl. PR #29 resident set + compaction
- * epoch). Scoped to DeepSeek V4 Pro only; v4 Flash is handled by
+ * synced to upstream main (a58b9c4, 2026-08-17; incl. PR #29 resident set,
+ * compaction epoch, context-gate migration, and dev-tool-search truncation).
+ * Scoped to DeepSeek V4 Pro only; v4 Flash is handled by
  * router-flash-deepseek.js.
  *
  * Modes (default: "zero"; override with ANCHOR_MODE=whoami opencode):
@@ -78,6 +79,10 @@ function pickMode(options) {
   if (value === "zero" || value === "anchored" || value === "whoami" || value === "off" || value === "none") {
     return value === "none" ? "off" : value
   }
+  // New sibling presets (eternal-minimal-deepseek.js, combo-deepseek.js)
+  // recognize these aliases as their own active mode; here they mean "let the
+  // sibling preset own the session; anchor-deepseek stands down".
+  if (value === "eternal" || value === "combo") return "off"
   console.error(`[anchor-deepseek] unknown mode ${JSON.stringify(value)}, falling back to "zero"`)
   return "zero"
 }
@@ -464,21 +469,25 @@ export const AnchorDeepSeek = async (input = {}, options = {}) => {
           }
 
           const wanted = query.toLowerCase().split(/[^a-z0-9_]+/).filter(Boolean)
-          const matches = Object.entries(catalog)
+          const all = Object.entries(catalog)
             .filter(([name, def]) => {
               const haystack = `${name} ${String(def?.description ?? "")}`.toLowerCase()
               return wanted.every((token) => haystack.includes(token))
             })
-            .slice(0, MAX_SEARCH_RESULTS)
+          const matches = all.slice(0, MAX_SEARCH_RESULTS)
 
-          if (matches.length === 0) {
+          if (all.length === 0) {
             lines.push(`No tools match "${query}".`)
           } else {
-            lines.push(`Matching tools (${matches.length}):`)
+            lines.push(`Matching tools (${matches.length}${all.length > MAX_SEARCH_RESULTS ? ` of ${all.length}` : ""}):`)
             for (const [name, def] of matches) {
               const desc = String(def?.description ?? "").split("\n")[0].slice(0, 90)
               lines.push(`- ${name}: ${desc}`)
             }
+            if (all.length > MAX_SEARCH_RESULTS) {
+              lines.push(`(truncated at ${MAX_SEARCH_RESULTS} — add tokens to narrow the query, e.g. "mcp browser" or "mcp tavily")`)
+            }
+            lines.push('Unlock with dev_tool_search({"toolNames": ["<exact name>"]}).')
           }
           return lines.join("\n")
         },
