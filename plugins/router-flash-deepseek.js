@@ -1,24 +1,41 @@
 /**
- * router-flash-deepseek.js — opencode port of dsh-router-standard (v0.2.0,
- * synced to upstream main f9667f7; only docs changed after eff787e), scoped
- * to DeepSeek V4 Flash only.
+ * router-flash-deepseek.js — opencode port of dsh-router-standard, synced to
+ * upstream v0.4 (main 6a34ceb), scoped to DeepSeek V4 Flash only.
  *
  * Reads the session's first top-level user message, classifies the task into
  * one of the measured behavior bands (spec / mixed / react) or weak (the
  * model routes itself), and applies one of two ROUTER MODES:
  *
- *  "standard" (default, v0.2.0): RL interface restoration — the first-turn
- *    system prompt is ONLY the RL training sentence and the first-turn tool
- *    surface is the RL shape (shell + editor). Measured: 25 steps / 24 tool
- *    calls / real artifacts vs 101K reasoning chars with zero action on the
- *    old read/write/edit surface. The near-field weak-mode guidance and the
+ *  "standard" (default): RL interface restoration — the first-turn system
+ *    prompt is ONLY the RL training sentence and the first-turn tool surface
+ *    is the RL shape (shell + editor). Measured: 25 steps / 24 tool calls /
+ *    real artifacts vs 101K reasoning chars with zero action on the old
+ *    read/write/edit surface. The near-field weak-mode guidance and the
  *    mode/band classification stay active.
  *
- *  "spec" (v0.1.1 behavior): deep-think-first — mode-matched persona
- *    (WEAK/REACT/SPEC) + mode-matched first-turn core tool set. The long
- *    first-turn reasoning chain is a feature, not a defect.
+ *  "spec": deep-think-first — mode-matched persona (WEAK/REACT/SPEC) +
+ *    mode-matched first-turn core tool set. The long first-turn reasoning
+ *    chain is a feature, not a defect.
  *
  *  Select via ROUTER_MODE=spec (env) or the plugin options { routerMode }.
+ *
+ * Upstream v0.4 changes ported here:
+ *  - We-Team near-field guidance (decision rhythm, one action per sentence).
+ *  - A `run_code`-style tool for executing a program in one shot. In DSH
+ *    Harness this is the PTC/Code Mode tool: the model writes a TypeScript
+ *    program against the generated SDK and `run_code` executes it once,
+ *    collapsing multiple round-trips into one call.
+ *  - opencode adaptation: `run_code` writes the supplied code to a temp file
+ *    and runs it with the best available runtime (bun/node/deno for JS/TS,
+ *    python3 for Python, bash for shell). There is no DSH SDK in opencode, so
+ *    the "generated SDK" part cannot be replicated; the one-shot program
+ *    execution semantics are preserved as closely as the plugin API allows.
+ *
+ * Upstream v0.4 NOT ported:
+ *  - `tool-presentation` / `tools.presentAs('code')` — opencode has no tool
+ *    presentation switching seam.
+ *  - DSH `tools:code-only` / `tools:sdk` system sections — opencode's system
+ *    transform is not a DSH section model.
  *
  * In both modes:
  *  - the persona stays in the system prompt for the WHOLE session,
@@ -38,6 +55,9 @@
  */
 
 import { tool } from "@opencode-ai/plugin"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { isAbsolute, join, resolve } from "node:path"
 
 const MODE_SPEC = 0
 const MODE_MIXED = 0.3
@@ -69,9 +89,18 @@ const WEAK_FLASH =
 const RL_PERSONA = "You are a helpful software engineer assistant."
 
 const GUIDE_WEAK =
-  "\nRouter: classify this task (build or fix) now, then adopt the matching style — build: direct production; fix: inspect-first. Think deeply first, then commit and act."
+  "\n\nWe/我们：先分类任务——build → 直接写 run_code 程序生产；fix → 先查后修。"
+  + " 我们的节奏：每句一个动作；每 2-3 句一个决策句（We decide / 我们决定）然后继续。"
+  + " 我们直接行动：晋升后第一句即调用 run_code 执行第一步；未晋升先用 bash/edit 建立行动。"
+  + " 我们验证、我们收敛、我们交付——决策后即前进。"
+  + "\nRouter: classify this task (build or fix) now, then adopt the matching style — build: direct production; fix: inspect-first. Think deeply first, then commit and act."
 const GUIDE_DEEP =
-  "\nRouter: classify this task (build or fix) now, then adopt the matching style — build: direct production; fix: inspect-first. Think deeply about the architecture, edge cases, and integration points. Do not spend reasoning on the environment or tooling. Produce when your information is complete. End each reasoning block with a decision or an information need."
+  "\n\nWe/我们：先分类任务——build → 直接生产；fix → 先查后修。"
+  + " 我们深入架构、边界与集成点（不猜环境、不重复检查）。"
+  + " 我们的节奏：每句一个动作；每 2-3 句一个决策句（We decide / 我们决定）然后继续。"
+  + " 我们直接行动：信息足够即调用 run_code 执行；未晋升先用 bash/edit 推进。"
+  + " 我们以决策或信息需求结束每个推理块；我们收敛、我们交付。"
+  + "\nRouter: classify this task (build or fix) now, then adopt the matching style — build: direct production; fix: inspect-first. Think deeply about the architecture, edge cases, and integration points. Do not spend reasoning on the environment or tooling. Produce when your information is complete. End each reasoning block with a decision or an information need."
 
 const COMPLEX_RE = /(重构|架构|全面|详细|设计|系统|优化|分析|survey|overview|architecture|refactor|comprehensive|detailed|design|system|optimize|analyze)/i
 const REACT_RE = /(开发|创建|写一个|生成|从零|做一个|游戏|网页|网站|构建|新项目|搭建|实现|做出|上线|落地|脚本|工具|应用|build|create|develop|generate|implement|make a|new project)/gi
@@ -217,8 +246,44 @@ function guidePartId(parts) {
   return `${maxId}g`
 }
 
+/**
+ * run_code opencode adaptation.
+ *
+ * DSH's run_code executes a TypeScript program against the generated SDK in
+ * one shot. opencode has no SDK and no presentation switch, so this helper
+ * writes the supplied program to a temp file and runs it once with the best
+ * available runtime. The one-shot "program execution" semantics are preserved;
+ * the SDK-specific surface is not available outside DSH Harness.
+ */
+async function resolveRunCodeRuntime($, language) {
+  const candidates =
+    language === "python" ? ["python3", "python"]
+      : language === "shell" ? ["bash", "sh"]
+        : ["bun", "node", "deno"]
+  for (const name of candidates) {
+    const probe = await $`command -v ${name}`.nothrow().quiet()
+    if (probe.exitCode === 0) return name
+  }
+  throw new Error(`run_code: no runtime found for ${language}; tried: ${candidates.join(", ")}`)
+}
+
+async function executeRunCode($, runtime, language, file, workdir) {
+  const runArgs = language === "typescript" && runtime === "deno"
+    ? [runtime, "run", file]
+    : [runtime, file]
+  const result = await $`${runArgs}`.cwd(workdir).nothrow().quiet()
+  const stdout = result.stdout ? result.stdout.toString() : ""
+  const stderr = result.stderr ? result.stderr.toString() : ""
+  const output = [stdout, stderr].filter((part) => part.length > 0).join("\n")
+  if (result.exitCode !== 0) {
+    throw new Error(output || `run_code exited with code ${result.exitCode} (no output)`)
+  }
+  return output || `run_code exited with code 0 (no output)`
+}
+
 export const RouterFlashDeepSeek = async (input = {}, options = {}) => {
   const client = input.client
+  const $ = input.$
   const routerMode = pickRouterMode(options)
 
   /** sessionID -> per-session router state (process local, like DSH plugins). */
@@ -381,6 +446,58 @@ export const RouterFlashDeepSeek = async (input = {}, options = {}) => {
           }
           const current = state.override !== null ? state.override : state.mode ?? MODE_WEAK
           return `mode=${fmtMode(current)} (band=${bandFor(current)}) — next request applies`
+        },
+      }),
+      run_code: tool({
+        description: [
+          "Execute a program in one shot (opencode adaptation of DSH Harness's run_code).",
+          "",
+          "Writes the supplied code to a temporary file and runs it once with the best available runtime: bun/node/deno for TypeScript or JavaScript, python3/python for Python, bash for shell.",
+          "",
+          "Use for batched multi-step operations that would otherwise take many tool round-trips — write one program, run it, read the result, iterate.",
+          "",
+          "The generated-SDK surface of DSH's run_code is not available in opencode; this is plain program execution against the session environment.",
+        ].join("\n"),
+        args: {
+          code: tool.schema
+            .string()
+            .describe("the program source to execute"),
+          language: tool.schema
+            .enum(["typescript", "javascript", "python", "shell"])
+            .optional()
+            .describe("program language (default: typescript)"),
+          workdir: tool.schema
+            .string()
+            .optional()
+            .describe("working directory for the run (default: session directory)"),
+        },
+        async execute(args, ctx) {
+          if (!$) return "run_code: no shell available in this plugin context"
+          const code = String(args?.code ?? "")
+          if (!code.trim()) return "run_code: empty `code` — provide a program to execute"
+          const language = args?.language ?? "typescript"
+          const workdir = args?.workdir
+            ? (isAbsolute(args.workdir) ? args.workdir : resolve(ctx.directory, args.workdir))
+            : ctx.directory
+          const ext =
+            language === "python" ? "py"
+              : language === "shell" ? "sh"
+                : language === "javascript" ? "js"
+                  : "ts"
+          let dir
+          try {
+            dir = await mkdtemp(join(tmpdir(), "opencode-run-code-"))
+            const file = join(dir, `main.${ext}`)
+            await writeFile(file, code, "utf8")
+            const runtime = await resolveRunCodeRuntime($, language)
+            return await executeRunCode($, runtime, language, file, workdir)
+          } catch (error) {
+            return `run_code failed: ${String((error && error.message) || error)}`
+          } finally {
+            if (dir) {
+              try { await rm(dir, { recursive: true, force: true }) } catch { /* best-effort cleanup */ }
+            }
+          }
         },
       }),
     },
