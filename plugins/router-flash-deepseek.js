@@ -1,43 +1,29 @@
 /**
  * router-flash-deepseek.js — opencode port of dsh-router-standard, synced to
- * upstream v0.4 (main 6a34ceb), scoped to DeepSeek V4 Flash only.
+ * upstream v0.1.1 (main 9727510), scoped to DeepSeek V4 Flash only.
  *
  * Reads the session's first top-level user message, classifies the task into
  * one of the measured behavior bands (spec / mixed / react) or weak (the
- * model routes itself), and applies one of two ROUTER MODES:
+ * model routes itself), and applies the matching persona + first-turn core
+ * tool surface. After the first durable tool call the full catalog opens.
  *
- *  "standard" (default): RL interface restoration — the first-turn system
- *    prompt is ONLY the RL training sentence and the first-turn tool surface
- *    is the RL shape (shell + editor). Measured: 25 steps / 24 tool calls /
- *    real artifacts vs 101K reasoning chars with zero action on the old
- *    read/write/edit surface. The near-field weak-mode guidance and the
- *    mode/band classification stay active.
+ * Upstream v0.1.1 (current) behavior ported here:
+ *  - classify -> persona + sections preserved + core tool surface.
+ *  - No RL-interface, no PTC/Code Mode, no We-Team protocol injection.
+ *  - Near-field weak-mode guidance is the simple Router classify text
+ *    (GUIDE_DEEP for complex tasks, GUIDE_WEAK otherwise).
+ *  - weak band first-turn core = read/write/edit + bash.
  *
- *  "spec": deep-think-first — mode-matched persona (WEAK/REACT/SPEC) +
- *    mode-matched first-turn core tool set. The long first-turn reasoning
- *    chain is a feature, not a defect.
+ * opencode adaptations:
+ *  - `run_code` is retained as an opencode convenience tool (one-shot program
+ *    execution with bun/node/deno/python/bash). Upstream v0.1.1 itself does
+ *    not define run_code; it is not part of the routed first-turn surface and
+ *    is only visible after promotion.
+ *  - opencode has no DSH section model; the router persona is kept in the
+ *    system prompt for the whole session.
+ *  - str_replace_editor analogue is `edit` (same mapping as anchor-deepseek.js).
  *
- *  Select via ROUTER_MODE=spec (env) or the plugin options { routerMode }.
- *
- * Upstream v0.4 changes ported here:
- *  - We-Team near-field guidance (decision rhythm, one action per sentence).
- *  - A `run_code`-style tool for executing a program in one shot. In DSH
- *    Harness this is the PTC/Code Mode tool: the model writes a TypeScript
- *    program against the generated SDK and `run_code` executes it once,
- *    collapsing multiple round-trips into one call.
- *  - opencode adaptation: `run_code` writes the supplied code to a temp file
- *    and runs it with the best available runtime (bun/node/deno for JS/TS,
- *    python3 for Python, bash for shell). There is no DSH SDK in opencode, so
- *    the "generated SDK" part cannot be replicated; the one-shot program
- *    execution semantics are preserved as closely as the plugin API allows.
- *
- * Upstream v0.4 NOT ported:
- *  - `tool-presentation` / `tools.presentAs('code')` — opencode has no tool
- *    presentation switching seam.
- *  - DSH `tools:code-only` / `tools:sdk` system sections — opencode's system
- *    transform is not a DSH section model.
- *
- * In both modes:
+ * In all modes:
  *  - the persona stays in the system prompt for the WHOLE session,
  *  - near-field routing guidance follows every real user message in weak
  *    mode (depth-adaptive: GUIDE_DEEP for complex tasks, GUIDE_WEAK
@@ -45,8 +31,7 @@
  *  - the session promotes to the full catalog after the first durable tool
  *    call (upstream promotes on tool/call only, NOT on a text-only reply).
  *  Mode and override are per-session and derived from durable history on
- *  resume. opencode's str_replace_editor analogue is `edit` (same mapping
- *  as anchor-deepseek.js).
+ *  resume.
  *
  * Model matching is provider-agnostic: only the model id matters
  * (deepseek + v4 + flash). dev_router_status / dev_router_mode expose the
@@ -82,25 +67,12 @@ const WEAK_FLASH =
   "You are a helpful assistant.\n"
   + "Before acting, decide the task type (build or fix) and adopt the matching "
   + "style: build → hands-on production; fix → inspect-and-plan.\n"
-  + "Before acting, briefly review what you have already done in this session and continue from where you left off; do not repeat completed steps. Do not run environment checks (echo, whoami, uname, node --version, date) or exhaustive grep/glob scans.\n"
-  + "Think deeply first, then produce."
-
-/** v0.2.0 standard router mode: the RL training sentence alone. */
-const RL_PERSONA = "You are a helpful software engineer assistant."
+  + "Before acting, briefly review what you have already done in this session and continue from where you left off; do not repeat completed steps. Do not run environment checks (echo, whoami, uname, node --version, date) or exhaustive grep/glob scans."
 
 const GUIDE_WEAK =
-  "\n\nWe/我们：先分类任务——build → 直接写 run_code 程序生产；fix → 先查后修。"
-  + " 我们的节奏：每句一个动作；每 2-3 句一个决策句（We decide / 我们决定）然后继续。"
-  + " 我们直接行动：晋升后第一句即调用 run_code 执行第一步；未晋升先用 bash/edit 建立行动。"
-  + " 我们验证、我们收敛、我们交付——决策后即前进。"
-  + "\nRouter: classify this task (build or fix) now, then adopt the matching style — build: direct production; fix: inspect-first. Think deeply first, then commit and act."
+  "\nRouter: classify this task (build or fix) now, then adopt the matching style — build: direct production; fix: inspect-first. Think deeply first, then commit and act."
 const GUIDE_DEEP =
-  "\n\nWe/我们：先分类任务——build → 直接生产；fix → 先查后修。"
-  + " 我们深入架构、边界与集成点（不猜环境、不重复检查）。"
-  + " 我们的节奏：每句一个动作；每 2-3 句一个决策句（We decide / 我们决定）然后继续。"
-  + " 我们直接行动：信息足够即调用 run_code 执行；未晋升先用 bash/edit 推进。"
-  + " 我们以决策或信息需求结束每个推理块；我们收敛、我们交付。"
-  + "\nRouter: classify this task (build or fix) now, then adopt the matching style — build: direct production; fix: inspect-first. Think deeply about the architecture, edge cases, and integration points. Do not spend reasoning on the environment or tooling. Produce when your information is complete. End each reasoning block with a decision or an information need."
+  "\nRouter: classify this task (build or fix) now, then adopt the matching style — build: direct production; fix: inspect-first. Think deeply about the architecture, edge cases, and integration points. Do not spend reasoning on the environment or tooling. Produce when your information is complete. End each reasoning block with a decision or an information need."
 
 const COMPLEX_RE = /(重构|架构|全面|详细|设计|系统|优化|分析|survey|overview|architecture|refactor|comprehensive|detailed|design|system|optimize|analyze)/i
 const REACT_RE = /(开发|创建|写一个|生成|从零|做一个|游戏|网页|网站|构建|新项目|搭建|实现|做出|上线|落地|脚本|工具|应用|build|create|develop|generate|implement|make a|new project)/gi
@@ -153,24 +125,17 @@ function personaFor(mode) {
   }
 }
 
-/** spec router mode: the v0.1.1 first-turn surface (weak walks the default
- *  branch; upstream v0.2.0 `legacyCore`). */
-function legacyCore(mode) {
+/** First-turn core tools (shell added dynamically by the plugin); upstream
+ *  v0.1.1 `coreFor`. */
+function coreFor(mode) {
   switch (bandOf(mode)) {
     case "spec":
-      return ["read", "edit", "glob", "grep"]
+      return ["read", "edit", "glob", "grep"] // read-first
+    case "transition":
+      return ["read", "edit", "write", "glob", "grep"] // union
     default:
-      return ["read", "write", "edit"]
+      return ["read", "write", "edit"] // write-first
   }
-}
-
-/** v0.2.0 router mode: "standard" (RL interface restoration, default) or
- *  "spec" (deep-think-first, the v0.1.1 behavior). */
-function pickRouterMode(options) {
-  const value = String(options?.routerMode ?? process.env.ROUTER_MODE ?? "standard").trim().toLowerCase()
-  if (value === "standard" || value === "spec") return value
-  console.error(`[router-flash-deepseek] unknown routerMode ${JSON.stringify(value)}, falling back to "standard"`)
-  return "standard"
 }
 
 function testinessFor(mode) {
@@ -284,7 +249,6 @@ async function executeRunCode($, runtime, language, file, workdir) {
 export const RouterFlashDeepSeek = async (input = {}, options = {}) => {
   const client = input.client
   const $ = input.$
-  const routerMode = pickRouterMode(options)
 
   /** sessionID -> per-session router state (process local, like DSH plugins). */
   const sessions = new Map()
@@ -370,9 +334,7 @@ export const RouterFlashDeepSeek = async (input = {}, options = {}) => {
       }
 
       const effective = state.override !== null ? state.override : state.mode ?? MODE_WEAK
-      // standard = RL shape (shell + editor); spec = the v0.1.1 surface.
-      const core = routerMode === "standard" ? ["edit"] : legacyCore(effective)
-      const keep = new Set(core)
+      const keep = new Set(coreFor(effective))
       keep.add("bash")
       for (const key of Object.keys(output.tools ?? {})) {
         if (!keep.has(key)) delete output.tools[key]
@@ -386,16 +348,19 @@ export const RouterFlashDeepSeek = async (input = {}, options = {}) => {
     },
 
     /** The routed persona stays in the system prompt for the whole session.
-     *  standard: only the RL training sentence (upstream strips every other
-     *  section — minimal `complete: true` semantics). */
+     *  Upstream v0.1.1 preserves the non-persona sections and injects the
+     *  router persona; opencode's system parts have no stable section names,
+     *  so replace the first part (the default persona) and keep any
+     *  additional system parts. */
     "experimental.chat.system.transform": async (hookInput, output) => {
       if (!isDeepSeekFlash(hookInput.model)) return
       if (!Array.isArray(output.system)) return
       const state = sessions.get(hookInput.sessionID)
       if (!state) return
       const effective = state.override !== null ? state.override : state.mode ?? MODE_WEAK
-      const persona = routerMode === "standard" ? RL_PERSONA : personaFor(effective)
-      output.system.splice(0, output.system.length, persona)
+      const persona = personaFor(effective)
+      if (output.system.length === 0) output.system.push(persona)
+      else output.system[0] = persona
     },
 
     /** Routing visibility and tuning (agent self-optimization). */
@@ -408,13 +373,9 @@ export const RouterFlashDeepSeek = async (input = {}, options = {}) => {
           const state = sessions.get(ctx.sessionID)
           if (!state) return "no router state for this session"
           const mode = state.override !== null ? state.override : state.mode ?? MODE_WEAK
-          // Effective values for the active router mode (upstream v0.2.0 shows
-          // the classification view; here persona/core reflect what is really
-          // injected so standard mode does not report a persona it never sent).
-          const persona = routerMode === "standard" ? RL_PERSONA : personaFor(mode)
-          const core = routerMode === "standard" ? ["edit", "bash"] : [...legacyCore(mode), "bash"]
+          const persona = personaFor(mode)
+          const core = [...coreFor(mode), "bash"]
           return [
-            `router-mode=${routerMode} (standard=RL接口还原 / spec=深度思考优先)`,
             `mode=${fmtMode(mode)} (band=${bandFor(mode)})`,
             `persona=${persona.replace(/\n/g, " / ")}`,
             `core=[${core.join(", ")}]`,
