@@ -1,22 +1,39 @@
 /**
  * router-flash-deepseek.js — opencode port of dsh-router-standard, synced to
- * upstream v0.1.1 (main 9727510), scoped to DeepSeek V4 Flash only.
+ * upstream v0.3.0 (release tag v0.3.0 = 97dfe7c, published 2026-08-21), scoped
+ * to DeepSeek V4 Flash only.
  *
  * Reads the session's first top-level user message, classifies the task into
  * one of the measured behavior bands (spec / mixed / react) or weak (the
  * model routes itself), and applies the matching persona + first-turn core
  * tool surface. After the first durable tool call the full catalog opens.
  *
- * Upstream v0.1.1 (current) behavior ported here:
+ * Upstream v0.3.0 (current release) behavior ported here:
  *  - classify -> persona + sections preserved + core tool surface.
  *  - No RL-interface, no PTC/Code Mode, no We-Team protocol injection.
  *  - Near-field weak-mode guidance is the simple Router classify text
  *    (GUIDE_DEEP for complex tasks, GUIDE_WEAK otherwise).
  *  - weak band first-turn core = read/write/edit + bash.
  *
+ * Upstream v0.3.0 fixes (real DSH assembly chain) and their opencode
+ * equivalence:
+ *  - #13 first-turn classification: DSH captured the first REAL user message
+ *    from `agent/inbox/claimed` (source.kind === 'user' only) and CLASSIFIES
+ *    it, instead of letting an empty transcript fall into weak. opencode
+ *    equivalence: chat.message classifies the incoming message before the
+ *    guide is appended, and classification from resumed history skips the
+ *    plugin's own "Router:" guide parts (the user-origin filter below).
+ *  - #34/#36/#55 near-field guidance: DSH injects the guide at
+ *    `agent/pre-step` into the SAME request as the user message (near-field,
+ *    cache-neutral, zero extra round-trips). opencode equivalence: the guide
+ *    is appended to the same message in chat.message (same request, no
+ *    extra API calls).
+ *  - #5 root sessions only (subagent skip): opencode uses the top-level
+ *    agent check below; #9 session model: per-hook model from the host.
+ *
  * opencode adaptations:
  *  - `run_code` is retained as an opencode convenience tool (one-shot program
- *    execution with bun/node/deno/python/bash). Upstream v0.1.1 itself does
+ *    execution with bun/node/deno/python/bash). Upstream v0.3.0 itself does
  *    not define run_code; it is not part of the routed first-turn surface and
  *    is only visible after promotion.
  *  - opencode has no DSH section model; the router persona is kept in the
@@ -160,6 +177,19 @@ function extractText(parts) {
     .join("\n")
 }
 
+/** The router's own injected guide parts (upstream #13 user-origin filter:
+ *  plugin-injected user-role text must never pin the band). */
+function isSelfGuide(part) {
+  return part?.type === "text" && typeof part.text === "string" && part.text.startsWith("Router:")
+}
+
+/** First real user text: the guide the router itself appended is not a
+ *  user-origin part, so classification never sees it (also keeps resume
+ *  history symmetric with the live first-turn classification). */
+function firstUserText(parts) {
+  return extractText((parts ?? []).filter((part) => !isSelfGuide(part)))
+}
+
 function classifyTask(text) {
   const react = countHits(REACT_RE, text)
   const spec = countHits(SPEC_RE, text)
@@ -271,7 +301,7 @@ export const RouterFlashDeepSeek = async (input = {}, options = {}) => {
             const parts = Array.isArray(item?.parts) ? item.parts : []
             if (info?.role === "user") {
               hasUser = true
-              if (firstText === "") firstText = extractText(parts)
+              if (firstText === "") firstText = firstUserText(parts)
             }
             if (parts.some((p) => p?.type === "tool-invocation")) hasToolCall = true
           }
@@ -300,7 +330,7 @@ export const RouterFlashDeepSeek = async (input = {}, options = {}) => {
       const state = await ensureState(hookInput.sessionID)
       if (!state) return
 
-      if (state.mode === undefined) state.mode = classifyTask(extractText(output.parts))
+      if (state.mode === undefined) state.mode = classifyTask(firstUserText(output.parts))
       const effective = state.override !== null ? state.override : state.mode
       if (effective !== MODE_WEAK) return
 
