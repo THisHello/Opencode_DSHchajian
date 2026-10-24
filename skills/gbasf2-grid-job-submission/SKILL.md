@@ -99,7 +99,7 @@ gb2_ds_get /belle/user/<grid-user>/<pilot-project> -o <local-dir> -f
 - 目标 trigger/变量分支是否 **非 NaN**；
 - prescale 值是否符合预期；
 - 关键选择后的计数是否合理；
-- 输出文件是否成功上传（Done 且能在 dataset 中列出）。
+- 输出文件是否成功上传（Done 且能在 dataset 中列出；只有 Done 不代表上传成功，见 5.1）。
 
 只有 pilot 全部通过，才允许放量。
 
@@ -151,19 +151,42 @@ No failover ses defined.
 gbasf2: SE candidates exhausted.
 ```
 
-这说明 basf2 本身可能已经成功，失败发生在最后上传阶段。
+这说明 basf2 本身可能已经成功，失败发生在最后上传阶段：物理结果是对的，只是输出写不出去。输出 SE 由作业实际运行的站点决定，`-d/--default_se` 已禁用，所以唯一可控手段是排除站点。
 
-处理原则：
+### 5.1 经验：一个不可写的 SE 会毁掉整批作业（2026-10-20 bucket49/50）
 
-- 用 `--banned_site` 排除不可用/不可写的站点，逗号分隔：
+实际经过：
+
+- `261020_Lumi_4S_exp42_2_bfzo` / `..._3_bfzo` 没有 ban UVic，作业被调度到 `DIRAC.UVic.ca` / `DIRAC.UVic-local.ca`，输出 SE 固定为 `UVic-TMP-SE`；
+- 该 SE 对当前用户不可写，b49 有 910 个、b50 有 26 个作业在 basf2 **成功之后**报 `Permission denied (13: SE.isValid: Write access not currently permitted.)` → `No failover ses defined` → `Error: data upload` → `254`；
+- 剩余 5128 + 4273 个作业被批量 kill 后重交，整批白跑一遍；
+- 同样输入、同样 steering、同样 release，其他站点正常完成（b49 658 个、b50 264 个 Done）；
+- 加 `--banned_site DIRAC.UVic.ca,DIRAC.UVic-local.ca` 重新提交（`bfz3`）后，同类上传失败为 0。
+
+两个关键认知：
+
+1. 这不是随机故障。同一个 SE、同一个权限错误，重试不会变好，只有换站点才会；
+2. 错误发生在最后一步，物理结果是对的，很容易被误判成 steering/变量问题。
+
+### 5.2 硬性做法
+
+- pilot 中只要有作业出现 `Permission denied (13: SE.isValid...)` 或 `No failover ses defined`，**先 ban 掉该站点再放量**，不要“先全量交再补”；
+- 放量命令显式写出 `--banned_site`，并把列表记录在提交日志里，不要依赖默认选择：
 
 ```bash
 --banned_site SITE_A,SITE_B
 ```
 
-- 不要 pin 死单个服务器；ban 掉坏站点后让 grid 自动调度其余站点。
-- `-d/--default_se` 当前被禁用，不要依赖它。
+- 提交后前 30 分钟重点看 Failed 是否集中在同一个 `Destination SEs`；同类失败集中出现时越早止损越好；
+- 一个坏站点的影响与调度到该站点的比例成正比：pilot 只有 2 个作业时可能只暴露 1 个失败，不代表比例低；
+- 不要 pin 死单个服务器；ban 掉坏站点后让 grid 自动调度其余站点；
 - 如果只剩一个可用站点，确认该站点满足 cputime 下限，并且输入副本可读。
+
+### 5.3 已知问题站点
+
+| 站点 | 症状 | 处理 |
+|---|---|---|
+| `DIRAC.UVic.ca`、`DIRAC.UVic-local.ca` | `UVic-TMP-SE` 不可写，上传失败 254 | ban |
 
 ---
 
