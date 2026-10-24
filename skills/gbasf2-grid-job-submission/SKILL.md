@@ -1,0 +1,333 @@
+---
+name: gbasf2-grid-job-submission
+description: Belle II gbasf2 用户作业（Data/MC ntuple）的 grid 提交与故障处理：pilot、cputime/队列最低要求、可写 SE 与 banned_site、Waiting/Failed 诊断、reschedule 与补交的区别、缺失输入恢复。
+compatibility: opencode
+metadata:
+  whenToUse: 需要用 gbasf2 提交 Data/MC 用户作业、作业长期 Waiting、出现 Failed/Killed、输出上传失败、需要 reschedule 或补交缺失输入时
+---
+
+# gbasf2 Grid 用户作业提交
+
+适用于 `gbasf2 steering.py -i <collection>` 这类用户分析作业（Data/MC ntuple）。
+不适用于 `b2dp-*` MCrd 生产链；后者见 `mcrd-grid-submission`。
+
+核心原则：**先 pilot，再放量；JDL 参数问题只能补交，不能靠 reschedule；不要整批 kill 未失败作业。**
+
+---
+
+## 1. 环境与代理
+
+```bash
+source /cvmfs/belle.cern.ch/tools/b2setup <release>
+source /cvmfs/belle.kek.jp/grid/gbasf2/pro/bashrc
+```
+
+先检查代理：
+
+```bash
+gb2_proxy_info
+```
+
+代理过期时续期（交互命令）：
+
+```bash
+gb2_proxy_init -g belle -v 24:00
+```
+
+注意：
+
+- 每个新 shell 都要重新 source。
+- 代理过期后 `gb2_job_status` 等客户端命令会失败，但已经在 grid 上运行的作业不受影响。
+- 长时间提交用 `nohup` 后台跑，避免客户端被终端/超时中断。
+
+---
+
+## 2. 提交前检查清单
+
+1. **release 与输入数据匹配**：用户作业的 release 应与输入 mdst 的生产 release 兼容。
+2. **Global tag / DB snapshot**：
+   - 生产数据通常绑定固定 DB snapshot（例如 `DB00001234`），不是当前中央 GT。
+   - 当前中央 GT 可能已经重命名 trigger bit；不要用当前 GT 的名字推断生产 ntuple 的分支名。
+   - 必须用 pilot 输出确认目标分支确实存在且非 NaN。
+3. **项目名**：gbasf2 项目名最长 **32 字符**。
+4. **输入**：collection 路径或 `--input_dslist` 文件；先用 `gb2_ds_list -s all` 确认文件可见。
+5. **输出 SE**：gbasf2 **没有 failover SE**；输出 SE 不可写会直接让作业以 254 失败。
+6. **磁盘/配额**：确认输出 dataset 路径和配额。
+
+---
+
+## 3. Pilot（强制）
+
+不要直接提交全量。先取 1–2 个输入文件：
+
+```bash
+gb2_ds_list -s all "<input-path>/sub00/*" | head -2 > pilot_inputs.txt
+```
+
+提交 pilot：
+
+```bash
+gbasf2 steering.py \
+  -p <pilot-project> \
+  -s <release> \
+  --input_dslist pilot_inputs.txt \
+  -n 1 \
+  --cputime 180 \
+  --noscout --force
+```
+
+下载并检查输出：
+
+```bash
+gb2_job_status -p <pilot-project>
+gb2_ds_get /belle/user/<grid-user>/<pilot-project> -o <local-dir> -f
+```
+
+必须检查：
+
+- 作业是否 Done；
+- 目标 trigger/变量分支是否 **非 NaN**；
+- prescale 值是否符合预期；
+- 关键选择后的计数是否合理；
+- 输出文件是否成功上传（Done 且能在 dataset 中列出）。
+
+只有 pilot 全部通过，才允许放量。
+
+---
+
+## 4. cputime 与队列最低要求
+
+`--cputime` 单位是**分钟**；JDL 里显示的是**秒**。
+
+常见下限（以实际诊断为准）：
+
+| 站点 | 最低 cputime |
+|---|---:|
+| KEK | 10800 s = 180 min |
+| Australia | 172800 s = 2880 min |
+
+诊断 Waiting 作业：
+
+```bash
+gb2_diagnostic --waiting_job <jobid> --no_color
+```
+
+重点看：
+
+```text
+JDL cputime (3600) < minCPUTimeAllQueue(10800.0)
+```
+
+如果 cputime 低于队列下限，作业会**永久 Waiting**，不会被匹配。
+
+关键结论：
+
+- `gb2_job_reschedule` **不会修改 JDL**，所以不能修复 cputime 太低的问题。
+- 必须用更高的 `--cputime` **补交新项目**。
+
+建议：pilot 通过后，正式提交的 `--cputime` 至少覆盖所有候选队列的最低值；不确定时用较高值（例如 180 min；需要 Australia 时用 2880 min）。
+
+---
+
+## 5. 站点与 SE
+
+失败日志里常见：
+
+```text
+Destination SEs=<SE>
+Skip unavailable <SE>: Permission denied (13: SE.isValid: Write access not currently permitted.)
+Failed to upload output data file
+No failover ses defined.
+gbasf2: SE candidates exhausted.
+```
+
+这说明 basf2 本身可能已经成功，失败发生在最后上传阶段。
+
+处理原则：
+
+- 用 `--banned_site` 排除不可用/不可写的站点，逗号分隔：
+
+```bash
+--banned_site SITE_A,SITE_B
+```
+
+- 不要 pin 死单个服务器；ban 掉坏站点后让 grid 自动调度其余站点。
+- `-d/--default_se` 当前被禁用，不要依赖它。
+- 如果只剩一个可用站点，确认该站点满足 cputime 下限，并且输入副本可读。
+
+---
+
+## 6. 正式提交
+
+推荐把提交命令写进脚本，用 `nohup` 后台执行：
+
+```bash
+nohup bash submit.sh > submit.log 2>&1 &
+```
+
+脚本中：
+
+```bash
+gbasf2 steering.py \
+  -p <project> \
+  -s <release> \
+  -i <collection> \
+  --cputime 180 \
+  --noscout --force \
+  --banned_site SITE_A,SITE_B
+```
+
+注意：
+
+- 成功 pilot 后才用 `--noscout`；否则保留 scout。
+- `--force` 用于非交互提交。
+- **不要**因为一部分作业失败就 kill 整个项目；先看 Done/Failed/Waiting 分布。
+- 大项目提交后，等所有 job 注册完成再判断状态；`Received` 不计入 `gb2_job_status` 的 summary。
+
+---
+
+## 7. 监控与诊断
+
+状态总览：
+
+```bash
+gb2_job_status -p <project>
+```
+
+Failed 详情：
+
+```bash
+gb2_job_status -p <project> --status Failed -l
+```
+
+单作业失败原因（不需要手动下载日志）：
+
+```bash
+gb2_diagnostic --failed_job <jobid> --no_color
+```
+
+Waiting 原因：
+
+```bash
+gb2_diagnostic --waiting_job <jobid> --no_color
+```
+
+Waiting 诊断会给出：
+
+- JDL cputime；
+- 输入 LFN 与副本 SE；
+- 各候选站点是否 Active；
+- 队列最低 cputime；
+- 最近 pilot 数量。
+
+---
+
+## 8. 取缺失作业的输入 LFN
+
+当需要只补交失败/卡住的输入时，用 DIRAC API：
+
+```python
+from BelleDIRAC.gbasf2.lib.job.information_collector import InformationCollector
+from DIRAC.Interfaces.API.Dirac import Dirac
+
+project = "<project>"
+ic = InformationCollector()
+d = Dirac()
+
+jobs = ic.getAllJobsInProject(
+    project, None, ["<grid-user>", "belle"], {"Status": ["Waiting"]}
+)["Value"]
+
+for j in jobs:
+    jdl = d.getJobJDL(j)["Value"]
+    print(j, jdl.get("InputData"), jdl.get("CPUTime"))
+```
+
+把 `Status` 改成 `Failed` 可获取失败作业输入。
+
+---
+
+## 9. reschedule 与补交的区别
+
+官方命令：
+
+```bash
+gb2_job_reschedule -p <project> --doAll
+gb2_job_reschedule -j <jobid1>,<jobid2>
+```
+
+硬限制：
+
+- 只处理 **Failed / Stalled / Killed**；
+- **Waiting 作业不会被选中**；
+- 复用**完全相同的 sandbox 和 JDL**；
+- 不能修改 cputime、site list、输入文件。
+
+因此：
+
+| 问题 | 能否用 reschedule 修 |
+|---|---|
+| pilot/站点临时停摆 | 可以先试 |
+| 输出 SE 临时不可写 | 可以先试；若 JDL 仍含坏站点，可能再次失败 |
+| cputime 低于队列下限 | **不能**，必须补交 |
+| site list 需要 ban 站点 | **不能**，必须补交 |
+| Waiting 卡住 | **不能**，reschedule 不选中 Waiting |
+| 输入文件/参数错误 | **不能**，必须补交 |
+
+gbasf2 自己的说明：
+
+> Only jobs which have fatal status (Failed, Killed, Stalled) are affected.
+> Exact same sandbox and parameters are reused. Thus you may need to submit a new project if there is an issue with the input parameters.
+
+---
+
+## 10. 缺失输入恢复流程
+
+1. 统计：
+
+```text
+missing = total_inputs - done
+missing ≈ waiting + failed (+ stalled)
+```
+
+2. 用第 8 节脚本收集 Waiting/Failed 的输入 LFN。
+3. 只 kill 确实卡住且无法修复的 Waiting 子集；不要 kill Done。
+4. 新建补交项目，例如 `<project>_fix`：
+   - `--input_dslist missing.txt`
+   - `--cputime` 设为满足目标队列下限的值
+   - `--banned_site` 排除已知坏站点
+   - `--noscout --force`
+5. 完成后再与主项目输出合并；逐文件确认没有重复输入。
+6. 合并后重新做计数/聚合，不要手工拼统计量。
+
+---
+
+## 11. 故障签名表
+
+| 现象 | 可能原因 | 处理 |
+|---|---|---|
+| `basf2helper.py Exited With Status 254` + `Error: data upload` | 输出上传失败 | 看 `Destination SEs`；ban 该站点或换站点补交 |
+| `Permission denied (13: SE.isValid...)` | SE 对当前用户不可写 | ban 该站点；不要重试同一 SE |
+| `No failover ses defined` | 没有备用 SE | 必须换站点；reschedule 可能重复失败 |
+| `Job stalled: pilot not running` | 站点/pilot 基础设施 | 先 reschedule；反复失败则 ban 该站点 |
+| 长期 Waiting + `JDL cputime < minCPUTimeAllQueue` | cputime 太低 | 提高 `--cputime` 补交 |
+| 长期 Waiting + 站点 `not available` | 站点没有 pilot | ban 不可用站点，或换有 pilot 的站点 |
+| `trigger name does not exist` / 分支全 NaN | GT/menu 与生产 snapshot 不一致 | 用生产 DB snapshot 重新 pilot，确认分支名 |
+| `Project name is too long` | 项目名 > 32 字符 | 缩短项目名 |
+| 作业停在 `Received` 很久 | 提交服务排队 | 等待；不要重复提交 |
+
+---
+
+## 12. 提交前快速 checklist
+
+- [ ] 代理有效
+- [ ] release 与输入数据匹配
+- [ ] DB snapshot / GT 已确认
+- [ ] pilot 1–2 文件通过，目标分支非 NaN
+- [ ] 项目名 ≤ 32 字符
+- [ ] `--cputime` ≥ 所有候选队列最低值
+- [ ] 已知坏站点已加入 `--banned_site`
+- [ ] 输出 SE 可写（pilot 已验证）
+- [ ] 大项目用 `nohup` 后台提交
+- [ ] 提交后先看 Done/Failed/Waiting，不急于 kill
+- [ ] 失败优先 `gb2_diagnostic`，再决定 reschedule 或补交
