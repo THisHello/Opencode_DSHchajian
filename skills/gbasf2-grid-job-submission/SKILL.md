@@ -1,9 +1,9 @@
 ---
 name: gbasf2-grid-job-submission
-description: Belle II gbasf2 用户作业（Data/MC ntuple）的 grid 提交与故障处理：pilot、cputime/队列最低要求、可写 SE 与 banned_site、Waiting/Failed 诊断、reschedule 与补交的区别、缺失输入恢复。
+description: Belle II gbasf2 用户作业（Data/MC ntuple）的 grid 提交与故障处理：pilot、cputime/队列最低要求、可写 SE 与 banned_site、Waiting/Failed 诊断，以及硬性规则（Waiting 不处理、Failed 只 reschedule、新项目必须先经用户确认）。
 compatibility: opencode
 metadata:
-  whenToUse: 需要用 gbasf2 提交 Data/MC 用户作业、作业长期 Waiting、出现 Failed/Killed、输出上传失败、需要 reschedule 或补交缺失输入时
+  whenToUse: 需要用 gbasf2 提交 Data/MC 用户作业、作业长期 Waiting、出现 Failed/Killed、输出上传失败、需要 reschedule，或需要在用户明确确认后补交缺失输入时
 ---
 
 # gbasf2 Grid 用户作业提交
@@ -11,7 +11,17 @@ metadata:
 适用于 `gbasf2 steering.py -i <collection>` 这类用户分析作业（Data/MC ntuple）。
 不适用于 `b2dp-*` MCrd 生产链；后者见 `mcrd-grid-submission`。
 
-核心原则：**先 pilot，再放量；JDL 参数问题只能补交，不能靠 reschedule；不要整批 kill 未失败作业。**
+核心原则：**先 pilot，再放量；Waiting 不处理；Failed 只 reschedule；不自行提交新项目；不要整批 kill 未失败作业。**
+
+---
+
+## 0. 硬性规则（必须遵守）
+
+- **Waiting 作业不要处理**：不 kill、不 reschedule、不补交、不提交新项目。
+- **Failed / Stalled / Killed 只用 `gb2_job_reschedule`**。
+- **不得自行提交新项目**。
+- **确需提交新项目时，必须先获得用户明确确认**；未确认前只能监控和 reschedule。
+- 不要因为一部分作业失败就 kill 整个项目。
 
 ---
 
@@ -123,7 +133,7 @@ JDL cputime (3600) < minCPUTimeAllQueue(10800.0)
 关键结论：
 
 - `gb2_job_reschedule` **不会修改 JDL**，所以不能修复 cputime 太低的问题。
-- 必须用更高的 `--cputime` **补交新项目**。
+- Waiting 作业**不处理**；不要自行补交新项目。若确实需要修正 JDL，先向用户说明并获得明确确认。
 
 建议：pilot 通过后，正式提交的 `--cputime` 至少覆盖所有候选队列的最低值；不确定时用较高值（例如 180 min；需要 Australia 时用 2880 min）。
 
@@ -224,7 +234,7 @@ Waiting 诊断会给出：
 
 ## 8. 取缺失作业的输入 LFN
 
-当需要只补交失败/卡住的输入时，用 DIRAC API：
+只有在用户明确确认要提交新项目时，才用 DIRAC API 收集对应输入 LFN：
 
 ```python
 from BelleDIRAC.gbasf2.lib.job.information_collector import InformationCollector
@@ -247,7 +257,7 @@ for j in jobs:
 
 ---
 
-## 9. reschedule 与补交的区别
+## 9. reschedule 与补交的区别（补交必须先确认）
 
 官方命令：
 
@@ -263,16 +273,16 @@ gb2_job_reschedule -j <jobid1>,<jobid2>
 - 复用**完全相同的 sandbox 和 JDL**；
 - 不能修改 cputime、site list、输入文件。
 
-因此：
+本项目的硬性规则：**Waiting 不处理；Failed 只 reschedule；任何新项目必须先经用户确认。**
 
-| 问题 | 能否用 reschedule 修 |
-|---|---|
-| pilot/站点临时停摆 | 可以先试 |
-| 输出 SE 临时不可写 | 可以先试；若 JDL 仍含坏站点，可能再次失败 |
-| cputime 低于队列下限 | **不能**，必须补交 |
-| site list 需要 ban 站点 | **不能**，必须补交 |
-| Waiting 卡住 | **不能**，reschedule 不选中 Waiting |
-| 输入文件/参数错误 | **不能**，必须补交 |
+| 问题 | 能否用 reschedule 修 | 本项目允许的动作 |
+|---|---|---|
+| pilot/站点临时停摆 | 可以先试 | 直接 reschedule |
+| 输出 SE 临时不可写 | 可以先试；若 JDL 仍含坏站点，可能再次失败 | 先 reschedule；反复失败则向用户说明，等待确认 |
+| cputime 低于队列下限 | **不能** | Waiting 保持原样；不自行补交 |
+| site list 需要 ban 站点 | **不能** | Waiting 保持原样；不自行补交 |
+| Waiting 卡住 | **不能**，reschedule 不选中 Waiting | 保持 Waiting，不处理 |
+| 输入文件/参数错误 | **不能** | 向用户说明，等待确认后再决定 |
 
 gbasf2 自己的说明：
 
@@ -281,37 +291,37 @@ gbasf2 自己的说明：
 
 ---
 
-## 10. 缺失输入恢复流程
+## 10. 缺失输入的处理流程
 
-1. 统计：
+按本项目的硬性规则，**不要自动补交**。
+
+1. **Waiting**：保持原样，不 kill、不 reschedule、不补交、不提交新项目。
+2. **Failed / Stalled / Killed**：只执行 `gb2_job_reschedule`；不要因为失败就新开项目。
+3. 如果 reschedule 后仍然反复失败，或确实需要修正 JDL / site list：
+   - 先向用户说明原因、影响范围和拟提交的输入清单；
+   - **只有得到用户明确确认后**，才允许提交新项目；
+   - 新项目只能包含缺失输入，不得重跑已完成文件。
+4. 统计口径（仅用于向用户说明，不自动执行）：
 
 ```text
 missing = total_inputs - done
 missing ≈ waiting + failed (+ stalled)
 ```
 
-2. 用第 8 节脚本收集 Waiting/Failed 的输入 LFN。
-3. 只 kill 确实卡住且无法修复的 Waiting 子集；不要 kill Done。
-4. 新建补交项目，例如 `<project>_fix`：
-   - `--input_dslist missing.txt`
-   - `--cputime` 设为满足目标队列下限的值
-   - `--banned_site` 排除已知坏站点
-   - `--noscout --force`
-5. 完成后再与主项目输出合并；逐文件确认没有重复输入。
-6. 合并后重新做计数/聚合，不要手工拼统计量。
+5. 用户确认后，才用第 8 节脚本收集对应输入 LFN，并提交最小子集项目。
 
 ---
 
 ## 11. 故障签名表
 
-| 现象 | 可能原因 | 处理 |
+| 现象 | 可能原因 | 按本项目规则的处理 |
 |---|---|---|
-| `basf2helper.py Exited With Status 254` + `Error: data upload` | 输出上传失败 | 看 `Destination SEs`；ban 该站点或换站点补交 |
-| `Permission denied (13: SE.isValid...)` | SE 对当前用户不可写 | ban 该站点；不要重试同一 SE |
-| `No failover ses defined` | 没有备用 SE | 必须换站点；reschedule 可能重复失败 |
-| `Job stalled: pilot not running` | 站点/pilot 基础设施 | 先 reschedule；反复失败则 ban 该站点 |
-| 长期 Waiting + `JDL cputime < minCPUTimeAllQueue` | cputime 太低 | 提高 `--cputime` 补交 |
-| 长期 Waiting + 站点 `not available` | 站点没有 pilot | ban 不可用站点，或换有 pilot 的站点 |
+| `basf2helper.py Exited With Status 254` + `Error: data upload` | 输出上传失败 | 先 reschedule；反复失败则向用户说明，等待确认 |
+| `Permission denied (13: SE.isValid...)` | SE 对当前用户不可写 | 先 reschedule；反复失败则向用户说明，等待确认 |
+| `No failover ses defined` | 没有备用 SE | 先 reschedule；反复失败则向用户说明，等待确认 |
+| `Job stalled: pilot not running` | 站点/pilot 基础设施 | 直接 reschedule；不要新开项目 |
+| 长期 Waiting + `JDL cputime < minCPUTimeAllQueue` | cputime 太低 | 保持 Waiting；向用户说明，不自行补交 |
+| 长期 Waiting + 站点 `not available` | 站点没有 pilot | 保持 Waiting；向用户说明，不自行补交 |
 | `trigger name does not exist` / 分支全 NaN | GT/menu 与生产 snapshot 不一致 | 用生产 DB snapshot 重新 pilot，确认分支名 |
 | `Project name is too long` | 项目名 > 32 字符 | 缩短项目名 |
 | 作业停在 `Received` 很久 | 提交服务排队 | 等待；不要重复提交 |
@@ -330,4 +340,7 @@ missing ≈ waiting + failed (+ stalled)
 - [ ] 输出 SE 可写（pilot 已验证）
 - [ ] 大项目用 `nohup` 后台提交
 - [ ] 提交后先看 Done/Failed/Waiting，不急于 kill
-- [ ] 失败优先 `gb2_diagnostic`，再决定 reschedule 或补交
+- [ ] Waiting 未做任何处理
+- [ ] Failed 只用 `gb2_job_reschedule`
+- [ ] 新项目已获得用户明确确认（如适用）
+- [ ] 失败优先 `gb2_diagnostic`；只用 reschedule；不自行补交
