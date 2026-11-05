@@ -1,6 +1,6 @@
 ---
 name: gbasf2-grid-job-submission
-description: Belle II gbasf2 用户作业（Data/MC ntuple）的 grid 提交与故障处理：pilot、cputime/队列最低要求、可写 SE 与 banned_site、Waiting/Failed 诊断，以及硬性规则（Waiting 不处理、Failed 只 reschedule、新项目必须先经用户确认）。
+description: Belle II gbasf2 用户作业（Data/MC ntuple）的 grid 提交与故障处理：pilot、cputime/队列最低要求、可写 SE 与 banned_site、Waiting/Failed 诊断、steering alias 缺失导致的整批秒失败，以及硬性规则（Waiting 不处理、Failed 只 reschedule、新项目必须先经用户确认）。
 compatibility: opencode
 metadata:
   whenToUse: 需要用 gbasf2 提交 Data/MC 用户作业、作业长期 Waiting、出现 Failed/Killed、输出上传失败、需要 reschedule，或需要在用户明确确认后补交缺失输入时
@@ -18,7 +18,7 @@ metadata:
 ## 0. 硬性规则（必须遵守）
 
 - **Waiting 作业不要处理**：不 kill、不 reschedule、不补交、不提交新项目。
-- **Failed / Stalled / Killed 只用 `gb2_job_reschedule`**。
+- **Failed / Stalled / Killed 默认只用 `gb2_job_reschedule`**。唯一例外是 steering/代码错误（见 §7.1）：此时 reschedule 必然重复失败，应修好 steering 后重新提交。
 - **不得自行提交新项目**。
 - **确需提交新项目时，必须先获得用户明确确认**；未确认前只能监控和 reschedule。
 - 不要因为一部分作业失败就 kill 整个项目。
@@ -63,6 +63,8 @@ gb2_proxy_init -g belle -v 24:00
 4. **输入**：collection 路径或 `--input_dslist` 文件；先用 `gb2_ds_list -s all` 确认文件可见。
 5. **输出 SE**：gbasf2 **没有 failover SE**；输出 SE 不可写会直接让作业以 254 失败。
 6. **磁盘/配额**：确认输出 dataset 路径和配额。
+7. **steering 的 alias**：从 `select_ee_gg_mumu.py` 派生的 steering 必须原样保留 `acolinearity`、`sumThetaCms`、`deltaPhiCms`、`deltaSumThetaCms`、`ECms`、`deg_clusterTheta` 的 `variables.addAlias(...)` 定义；这些**不是** basf2 内置变量，漏掉会让全部作业在 `VariablesToNtuple` 处 FATAL（见 §7.1）。
+8. **输入规模**：用 `--dryrun` 确认 `Number of input files` / `Number of jobs`，再正式提交。
 
 ---
 
@@ -217,6 +219,23 @@ gbasf2 steering.py \
 - **不要**因为一部分作业失败就 kill 整个项目；先看 Done/Failed/Waiting 分布。
 - 大项目提交后，等所有 job 注册完成再判断状态；`Received` 不计入 `gb2_job_status` 的 summary。
 
+### 6.1 输入范围与 `-n` 的语义
+
+- `-n N` 是**每个作业的文件数**，不是总文件数上限。`-i <collection> -n 20` 仍然会处理整个 collection。
+- 要限制总输入，用路径通配符或显式列表：
+
+  ```bash
+  -i "/belle/.../mdst/sub00/mdst_0000*.root"        # 99 个文件
+  -i <collection> --input_dslist input.txt          # 显式 LFN 列表
+  ```
+
+- `--input_ds_search` 必须同时给 `campaign=` 和 `data_level=`。2026-11-04 实测：
+  - `campaign=PromptRel9;data_level=mdst` 可以解析；
+  - 加 `run=959:961` 返回 `No input dataset`；
+  - `exp=42:42` 能解析，但包含整个 exp42（24,445 个文件），不能用来限定 bucket。
+- 提交前用 `--dryrun` 看 `Number of input files` / `Number of jobs`，不要盲提。
+- **显式给 `--cputime`**，否则使用默认值并触发警告。
+
 ---
 
 ## 7. 监控与诊断
@@ -252,6 +271,40 @@ Waiting 诊断会给出：
 - 各候选站点是否 Active；
 - 队列最低 cputime；
 - 最近 pilot 数量。
+
+### 7.1 steering 自身报错：全批秒失败（2026-11-04 baseScan）
+
+**现象**：`gb2_job_status` 显示全部作业在 1 分钟内 `Failed`，失败数等于作业数，`Done 0`。
+
+**诊断**：
+
+```bash
+gb2_job_output -p <project> <jobid>     # 下载到 ./log/<project>/<jobid>/
+tail -20 log/<project>/<jobid>/Script1_basf2helper.py.log
+```
+
+典型输出：
+
+```
+[FATAL] Encountered bad variable name 'acolinearity'. Maybe you misspelled it?
+  { module: VariablesToNtuple_vpho:base function: ...createVariable(const std::string&) }
+ERROR: The execution of basf2 ... failed.
+```
+
+**原因**：`acolinearity`、`sumThetaCms`、`deltaPhiCms`、`deltaSumThetaCms`、`ECms`、`deg_clusterTheta` 都不是 basf2 内置变量，而是在 `select_ee_gg_mumu.py` 里用 `variables.addAlias` 定义的。任何从该 steering 派生、做删改的版本，只要漏掉这段 alias，都会在 `VariablesToNtuple` 处 FATAL，**所有作业同时失败**。
+
+**必须原样带上的 alias**：
+
+```python
+variables.addAlias('deltaPhiCms', 'formula(57.2957795*daughterDiffOfPhiCMS(0, 1))')
+variables.addAlias('acolinearity', 'formula(abs(deltaPhiCms) - 180.)')
+variables.addAlias('sumThetaCms',
+    'formula(57.2957795*(daughter(0, useCMSFrame(theta)) + daughter(1, useCMSFrame(theta))))')
+variables.addAlias('deltaSumThetaCms', 'formula(sumThetaCms - 180.)')
+variables.addAlias('ECms', 'useCMSFrame(E)')
+```
+
+**处理**：**不要 `gb2_job_reschedule`**——steering 不改，重跑必然同样失败。修好后重新提交；项目名已被占用就用 `_v2`（≤32 字符）。失败的旧项目可以保留，不影响新项目。
 
 ---
 
@@ -346,6 +399,8 @@ missing ≈ waiting + failed (+ stalled)
 | 长期 Waiting + `JDL cputime < minCPUTimeAllQueue` | cputime 太低 | 保持 Waiting；向用户说明，不自行补交 |
 | 长期 Waiting + 站点 `not available` | 站点没有 pilot | 保持 Waiting；向用户说明，不自行补交 |
 | `trigger name does not exist` / 分支全 NaN | GT/menu 与生产 snapshot 不一致 | 用生产 DB snapshot 重新 pilot，确认分支名 |
+| `[FATAL] Encountered bad variable name '<x>'`（`VariablesToNtuple`） | steering 缺少 alias（见 §7.1） | **修 steering 后重新提交**，不要 reschedule |
+| 全批 1 分钟内 Failed，失败率 100% | steering/代码错误，不是站点问题 | 先看一个作业的 `Script1_basf2helper.py.log` |
 | `Project name is too long` | 项目名 > 32 字符 | 缩短项目名 |
 | 作业停在 `Received` 很久 | 提交服务排队 | 等待；不要重复提交 |
 
@@ -356,6 +411,8 @@ missing ≈ waiting + failed (+ stalled)
 - [ ] 代理有效
 - [ ] release 与输入数据匹配
 - [ ] DB snapshot / GT 已确认
+- [ ] steering 需要的 alias 全部定义（`acolinearity` / `sumThetaCms` / `ECms` 等）
+- [ ] `--dryrun` 已确认输入文件数与作业数
 - [ ] pilot 1–2 文件通过，目标分支非 NaN
 - [ ] 项目名 ≤ 32 字符
 - [ ] `--cputime` ≥ 所有候选队列最低值
@@ -364,6 +421,6 @@ missing ≈ waiting + failed (+ stalled)
 - [ ] 大项目用 `nohup` 后台提交
 - [ ] 提交后先看 Done/Failed/Waiting，不急于 kill
 - [ ] Waiting 未做任何处理
-- [ ] Failed 只用 `gb2_job_reschedule`
+- [ ] Failed 默认只 `gb2_job_reschedule`；steering/代码错误修好后重新提交
 - [ ] 新项目已获得用户明确确认（如适用）
-- [ ] 失败优先 `gb2_diagnostic`；只用 reschedule；不自行补交
+- [ ] 失败优先 `gb2_diagnostic` / `Script1_basf2helper.py.log`；站点类失败只 reschedule，steering/代码错误修好后重新提交
